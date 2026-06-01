@@ -1,139 +1,105 @@
-# Hermes Multiplex Plugin — Architecture Blueprint
+# Hermes Multiplex Plugin — Architecture Blueprint v2
 
 ## Problem Statement
 
-Goran is locked to the conductor profile in Telegram. Cannot directly interact with any other agent (analyst, coder, etc.). Needs to:
-1. Switch between agent sessions within a single chat
-2. See responses from all agents with session-specific prefixes
-3. Spawn new sessions without interrupting current session
-4. Message any agent with `@agent` syntax from any session
-5. Receive subagent delegation responses inline
+Goran is locked to the conductor profile in Telegram. Cannot directly interact with any other agent. Needs:
 
----
-
-## Architecture Overview
-
-### Component Map
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    TELEGRAM / WHATSAPP                    │
-│                      (any platform)                      │
-└──────────────────────┬──────────────────────────────────┘
-                       │ Message arrives at gateway
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│                 MULTIPLEX PLUGIN                         │
-│  ┌──────────┐  ┌───────────┐  ┌──────────────┐         │
-│  │ PREFIX   │  │ SESSION   │  │ RESPONSE     │         │
-│  │ PARSER   │  │ TRACKER   │  │ RELAY        │         │
-│  │          │  │           │  │              │         │
-│  │ @analyst │  │ per-agent │  │ [analyst-01] │         │
-│  │ @coder   │  │ session   │  │ prefix       │         │
-│  │ /switch  │  │ state     │  │ injection    │         │
-│  │ /spawn   │  │           │  │              │         │
-│  └──────────┘  └───────────┘  └──────────────┘         │
-│                                                         │
-│  ┌──────────────────────────────────────────────────┐  │
-│  │              CONFIG STORE (YAML)                  │  │
-│  │  - Agent mapping (name → profile)                │  │
-│  │  - Session history per chat_id                   │  │
-│  │  - Prefix format configuration                   │  │
-│  │  - Auto-switch on spawn (yes/no)                 │  │
-│  └──────────────────────────────────────────────────┘  │
-└──────────────────────┬──────────────────────────────────┘
-                       │ Routed to correct profile
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│              GATEWAY PROFILE ROUTER                      │
-│                                                         │
-│  conductor ──→ analyst ──→ coder ──→ reviewer ──→ ...  │
-│  (default)      (active)    (idle)     (idle)           │
-│                                                         │
-│  Each profile gets its own:                             │
-│  - Session store (isolated context)                     │
-│  - System prompt (role-specific)                        │
-│  - Toolset (role-specific)                             │
-│  - Memory (Graphiti/Tier2 for conductor only)           │
-└─────────────────────────────────────────────────────────┘
-```
+1. **Chat with any agent** using natural `@agentname` mentions
+2. **Single chat, multiple agents** — all responses appear inline with prefixes
+3. **Persistent sessions** — `@analyst` messages go to same analyst session until explicitly reset
+4. **Session management** via `/multix` commands
+5. **Subagent visibility** — see delegation chain responses inline
 
 ---
 
 ## Command Design
 
-### Prefix-Based Routing (Primary)
+### Primary: `@agentname` Inline Mentions (Natural Chat)
 
 ```
-/analyst investigate gateway OOM
-         ↓
-    Multiplex Gate strips "/analyst"
-         ↓
-    Routes "investigate gateway OOM" to analyst profile
-         ↓
-    Analyst responds → [analyst-4f2a] Root cause: socket leak
+Goran: @analyst investigate why gateway OOM keeps happening
+       @researcher find open source alternatives to Docmost
+
+[analyst-4f2a]    Investigating... tracing 3 code paths
+[researcher-b7d3] Searching SearXNG... 12 results found
+
+[analyst-4f2a]    Root cause: WebSocket leak at discord.js:3275. 
+                  Confidence 0.92. Evidence: 3 independent paths converge.
+
+[researcher-b7d3] Top alternatives: HedgeDoc (Docker, free, REST API),
+                  Outline (requires license), BookStack (no real-time collab).
+
+Goran: @analyst what's the fix?
+[analyst-4f2a]    Same session (4f2a). Fix: add close() handler at line 3275.
+                  Want me to tell @coder?
+
+Goran: @coder apply the fix at discord.js:3275
+[coder-8e1c]       Applied. 4 tests pass, 0 fail.
+
+Goran: @analyst-4f2a what was that confidence score again?
+[analyst-4f2a]    0.92 — traced from 3 independent code paths.
 ```
 
-### Session Switching Commands
-
-| Command | Action | Example |
-|---------|--------|---------|
-| `/switch analyst` | Switch current chat to analyst session | Messages now go to analyst |
-| `/switch main` | Return to conductor (main) session | Default behavior |
-| `/switch @coder` | Alternative syntax | Same as /switch coder |
-| `/spawn architect [task]` | Create NEW architect session, optionally assign task | `/spawn architect design API` |
-| `/spawn architect autoswitch` | Spawn and auto-switch to new session | Configurable default |
-| `/list` | List all active sessions + their status | `[main-a3f2] Running, [analyst-4f2a] Idle 5m` |
-
-### Session-Aware Prefixing
-
-Every response from an agent is prefixed with `[agent-session_id]`:
+### Secondary: `/multix` Management Commands
 
 ```
-[analyst-4f2a] Root cause: WebSocket handler at discord.js:3275
-               needs close() call. Evidence: 3 code paths, 0.92 confidence.
-
-[coder-7b1c]    Fix applied — added close handler at discord.js:3312.
-                Tests: 4 pass, 0 fail.
-
-[main-d9e3]     Goran, coder applied the fix. Want me to spawn reviewer
-                for verification?
+/multix switch analyst     → Switch default routing to analyst (no prefix = analyst)
+/multix switch main        → Return default routing to conductor
+/multix spawn researcher   → Create NEW researcher session (fresh context)
+/multix list               → Show all active sessions + status
+/multix list analyst       → Show all analyst sessions
+/multix kill analyst-4f2a  → End a specific session
+/multix config             → Show current configuration
 ```
 
-### Cross-Session Messaging
-
-From ANY session, you can message another agent:
+### Routing Logic
 
 ```
-[analyst-4f2a] I've traced the root cause.
-@coder patch discord.js:3275 with close handler
+Message arrives
+    │
+    ├── Contains @agentname? → Route to that agent's active session
+    │   └── No active session? → Create new session for that agent
+    │
+    ├── Contains @sessionid? → Route to that specific session
+    │   └── Session doesn't exist? → Reply "[conductor] Session X not found. Active: ..."
+    │
+    ├── Starts with /multix? → Process management command
+    │
+    └── No prefix? → Route to currently active session (default: conductor)
+```
 
-→ Conductor intercepts @coder → routes to coder-7b1c session
-→ If coder session doesn't exist, auto-creates one
-→ Coder processes and responds
-→ Both messages show in chat with correct prefixes
+---
+
+## Response Format
+
+Every agent response is prefixed with `[agent-session_id]`:
+
+```
+[analyst-4f2a]    4-character session ID for easy reference
+[coder-8e1c]      Same format for all agents
+[researcher-b7d3] You can @mention the session ID: @analyst-4f2a
+[main-d9e3]       Conductor sessions use "main" as agent name
+[orch-2f1a]       Orchestrator follows same pattern
 ```
 
 ### Subagent Delegation Visibility
 
-When the conductor delegates to a subagent:
+When the conductor delegates, you see the chain inline:
 
 ```
-You:  @conductor analyze gateway OOM
-                    │
-[main-d9e3]         Spawning analyst for investigation...
-                    │
-[analyst-4f2a]      Investigating... analyzing 3 code paths
-[analyst-4f2a]      Root cause found: WebSocket leak, 0.92 confidence
-                    │
-[main-d9e3]         Analyst complete. Root cause: socket leak.
-                    Spawning reviewer for verification...
-                    │
-[reviewer-2e8f]     Verifying analyst findings...
-[reviewer-2e8f]     CONFIRMED: 3/3 evidence chains match. PASS.
-                    │
-[main-d9e3]         All subagents complete. Fix available.
-                    Want me to spawn coder?
+Goran: @conductor analyze gateway OOM end-to-end
+
+[main-d9e3]        Spawning analyst...
+
+[analyst-4f2a]     Root cause: WebSocket leak at discord.js:3275 (0.92)
+[main-d9e3]        Analyst done. Spawning reviewer...
+
+[reviewer-5b2c]    Verifying... CONFIRMED. 3/3 evidence chains match. PASS.
+[main-d9e3]        All checks passed. Spawning coder...
+
+[coder-8e1c]       Patch applied at discord.js:3275. 4 tests pass.
+[main-d9e3]        Done. Fix applied and verified. 
+                   Root cause: WebSocket leak. Fix: close handler. Tests: 4/4.
 ```
 
 ---
@@ -142,316 +108,210 @@ You:  @conductor analyze gateway OOM
 
 ```
                     ┌────────┐
-     new message ──→│ ROUTE  │←── message with @agent prefix
+     message ───────→│ ROUTE  │
                     └───┬────┘
                         │
-                ┌───────┼───────┐
-                ▼       ▼       ▼
-           ┌────────┐ ┌──────┐ ┌──────────┐
-           │CONDUCTOR│ │AGENT1│ │AGENT2... │
-           │(default)│ │      │ │          │
-           └───┬────┘ └──┬───┘ └────┬─────┘
-               │         │          │
-               │    ┌────▼────┐     │
-               │    │PROCESS  │     │
-               │    └────┬────┘     │
-               │         │          │
-               ▼         ▼          ▼
-           ┌──────────────────────────────┐
-           │    RESPONSE with [prefix]    │
-           │    delivered to Telegram     │
-           └──────────────────────────────┘
-
-Session Lifecycle:
-  ACTIVE → message received → keep alive
-  ACTIVE → 15min idle → IDLE (session kept, context preserved)
-  IDLE → message → ACTIVE (resume with full context)
-  IDLE → /switch → ACTIVE (user manually activates)
-  NEW → /spawn → ACTIVE (fresh session)
-  DONE → agent signals completion → ARCHIVED (summary kept)
+          ┌─────────────┼─────────────┐
+          ▼             ▼             ▼
+    @agentname     /multix cmd    no prefix
+          │             │             │
+          ▼             ▼             ▼
+   ┌──────────┐  ┌──────────┐  ┌──────────────┐
+   │Find/create│  │Process   │  │Route to      │
+   │session   │  │command   │  │active session│
+   └────┬─────┘  └──────────┘  └──────┬───────┘
+        │                             │
+        ▼                             ▼
+   ┌──────────────────────────────────────┐
+   │        Agent processes message       │
+   └────────────────┬─────────────────────┘
+                    │
+                    ▼
+   ┌──────────────────────────────────────┐
+   │  Response with [agent-session_id]    │
+   │  delivered to SAME Telegram chat     │
+   └──────────────────────────────────────┘
 ```
+
+**Session lifecycle:**
+- ACTIVE → receiving messages → keep alive
+- 15min idle → IDLE (context preserved)
+- IDLE → @mention → ACTIVE (resume with full context)
+- `/multix kill` → ARCHIVED
+- `/multix spawn` → NEW (fresh context, even if active session exists)
 
 ---
 
-## Integration Points (Based on Gateway Code Analysis)
+## Agent Configuration
 
-### Gateway Hook: `pre_gateway_dispatch`
-**Location:** `gateway/run.py:5804`
-**What it does:** Fires BEFORE message reaches profile router. Perfect injection point for prefix detection.
-
-```
-Message arrives → pre_gateway_dispatch hook
-    → Multiplex plugin: strip prefix, lookup session, reroute
-    → OR: pass through unchanged (conductor default)
-```
-
-### Session Key Manipulation
-**Location:** `gateway/session.py:600`
-**Current:** `agent:main:{platform}:{chat_type}:{chat_id}[...]`
-**Multiplex modification:** `agent:{agent_name}:{platform}:{chat_type}:{chat_id}:{session_id}`
-
-Each agent gets its own session key namespace within the same chat.
-
-### Plugin Registration
-**Reference:** `hermes_cli/plugins.py:287` (PluginContext)
-**Pattern:** 
-```yaml
-# plugin.yaml
-name: multiplex
-kind: standalone  # or backend
-provides_tools:
-  - switch_session
-  - spawn_session
-  - list_sessions
-commands:
-  - /switch
-  - /spawn
-  - /list
-  - /sessions
-```
-
-### Config API (EVOL-style reference)
-**Reference:** EVOL plugin `config.py` pattern
-**Multiplex config:**
 ```yaml
 # ~/.hermes/profiles/conductor/plugins/multiplex/config.yaml
+
 multiplex:
   agents:
-    analyst: { profile: "analyst", enabled: true, prefix: "[analyst]" }
-    coder: { profile: "coder", enabled: true, prefix: "[coder]" }
-    researcher: { profile: "researcher", enabled: true, prefix: "[researcher]" }
-    operative: { profile: "operative", enabled: true, prefix: "[operative]" }
-    reviewer: { profile: "reviewer", enabled: true, prefix: "[reviewer]" }
-    architect: { profile: "architect", enabled: true, prefix: "[architect]" }
-    orchestrator: { profile: "orchestrator", enabled: true, prefix: "[orch]" }
-    shadow: { profile: "shadow", enabled: true, prefix: "[shadow]" }
-    valmet: { profile: "valmet", enabled: true, prefix: "[valmet]" }
+    analyst:
+      profile: "analyst"
+      prefix: "[analyst]"
+      description: "Root cause investigation, code analysis, FalkorDB graphs"
+      auto_create: true
+    
+    coder:
+      profile: "coder"
+      prefix: "[coder]"
+      description: "Code changes, OpenHands delegation, repo work"
+      auto_create: true
+    
+    researcher:
+      profile: "researcher"
+      prefix: "[researcher]"
+      description: "Web research, SearXNG, OSINT, comparative analysis"
+      auto_create: true
+    
+    operative:
+      profile: "operative"
+      prefix: "[operative]"
+      description: "Docker, SSH, infrastructure, deployments"
+      auto_create: true
+    
+    reviewer:
+      profile: "reviewer"
+      prefix: "[reviewer]"
+      description: "Code verification, Selenium testing, adversarial validation"
+      auto_create: true
+    
+    architect:
+      profile: "architect"
+      prefix: "[architect]"
+      description: "Blueprint design, Docmost publishing, system architecture"
+      auto_create: true
+    
+    orchestrator:
+      profile: "orchestrator"
+      prefix: "[orch]"
+      description: "Multi-agent lane coordination, taskboard management"
+      auto_create: true
+    
+    shadow:
+      profile: "shadow"
+      prefix: "[shadow]"
+      description: "Offensive security, dark reasoning, Venice API"
+      auto_create: false  # Requires explicit spawn
+    
+    valmet:
+      profile: "valmet"
+      prefix: "[valmet]"
+      description: "Industrial automation, DNA protocols, LightRAG"
+      auto_create: false  # Requires explicit spawn
+  
   settings:
     default_agent: "conductor"
-    auto_switch_on_spawn: false
+    conductor_prefix: "[main]"
     session_idle_timeout: 900  # 15 minutes
-    show_delegation_chain: true
+    show_delegation_chain: true  # Show [main→analyst→reviewer] chain
     prefix_format: "[{agent}-{session_id}]"
+    auto_create_agents: true  # Create session on first @mention
+  
   platforms:
-    telegram: { enabled: true }
-    whatsapp: { enabled: false, adapter: "whatsapp_web" }
-    discord: { enabled: false }
-    cli: { enabled: true }
+    telegram:
+      enabled: true
+    cli:
+      enabled: true
 ```
 
 ---
 
-## Component Specifications
+## Plugin Structure
 
-### 1. Prefix Parser (`src/parser.py`)
 ```
-Input:  "/analyst investigate gateway OOM"
-Output: { agent: "analyst", message: "investigate gateway OOM", command: null }
-
-Input:  "/switch coder"
-Output: { agent: null, message: null, command: { type: "switch", target: "coder" } }
-
-Input:  "/spawn researcher search for alternatives"
-Output: { agent: null, message: "search for alternatives", command: { type: "spawn", target: "researcher" } }
-
-Input:  "@coder fix the bug"
-Output: { agent: "coder", message: "fix the bug", command: null }
-```
-
-**Supports:** `/prefix`, `@prefix`, `!prefix`, configurable.
-
-### 2. Session Tracker (`src/tracker.py`)
-```
-Data structure:
-{
-  "telegram:-1001234567890": {
-    "active": "analyst-4f2a",
-    "sessions": {
-      "main-d9e3": {
-        "profile": "conductor",
-        "state": "ACTIVE",
-        "created": "2026-06-01T15:00:00Z",
-        "last_active": "2026-06-01T15:05:00Z"
-      },
-      "analyst-4f2a": {
-        "profile": "analyst",
-        "state": "IDLE",
-        "created": "2026-06-01T14:45:00Z",
-        "last_active": "2026-06-01T14:50:00Z"
-      }
-    }
-  }
-}
-```
-
-**Operations:**
-- `get_session(chat_id, agent)` → session_id
-- `set_active(chat_id, session_id)` → switch context
-- `create_session(chat_id, agent, profile)` → new session_id
-- `list_sessions(chat_id)` → all active sessions
-
-### 3. Response Relay (`src/relay.py`)
-```
-Input:  agent_output from any profile
-Output: prefixed message to Telegram
-
-Process:
-1. Agent produces response (via gateway response handler)
-2. Relay intercepts via post_response hook
-3. Injects [agent-session_id] prefix
-4. Forwards to platform adapter for delivery
-5. Logs to session transcript
-```
-
-### 4. Config Manager (`src/config.py`)
-```
-- Load YAML config ~/.hermes/profiles/conductor/plugins/multiplex/config.yaml
-- Register slash commands through PluginContext
-- Expose config via /multiplex config set/get commands
-- Hot-reload support (watch file changes)
-```
-
-### 5. Command Registry (`src/commands.py`)
-```
-Registered commands:
-  /switch <agent>     → activate agent session
-  /spawn <agent>      → create new session
-  /list               → show active sessions
-  /sessions           → detailed session info
-  /multiplex config   → get/set configuration
-  /multiplex status   → plugin health + stats
+hermes-multiplex/
+├── plugin.yaml              # Manifest
+├── src/
+│   ├── __init__.py
+│   ├── parser.py            # @agentname, @sessionid, /multix detection
+│   ├── tracker.py           # Per-chat session state (ACTIVE/IDLE/ARCHIVED)
+│   ├── router.py            # Message routing to correct profile session
+│   ├── relay.py             # Response prefix injection
+│   └── commands.py          # /multix switch, spawn, list, kill, config
+├── config/
+│   └── config.yaml          # Default agent mapping + settings
+├── state/
+│   └── sessions.json        # Runtime session registry per chat_id
+├── tests/
+│   ├── test_parser.py
+│   ├── test_tracker.py
+│   └── test_router.py
+└── docs/
+    └── ARCHITECTURE.md
 ```
 
 ---
 
-## Platform Abstraction
+## Gateway Integration Points
 
-The multiplex plugin MUST be platform-agnostic. Same commands and prefixes work on Telegram, WhatsApp, Discord, CLI.
+| Hook | Location | What It Does |
+|------|----------|-------------|
+| `pre_gateway_dispatch` | `gateway/run.py:5804` | Intercept message BEFORE profile routing — detect @mentions, /multix |
+| Session key manipulation | `gateway/session.py:600` | Inject `agent_name:session_id` into session keys for per-agent isolation |
+| Response handler | Gateway output adapter | Inject `[agent-session_id]` prefix before platform delivery |
+| `delegate_task` interceptor | `tools/delegate_tool.py` | Capture subagent responses for inline visibility |
 
-```
-Message In → ParseMessage (platform adapter)
-    → MultiplexGate (prefix detection, routing)
-    → ProfileRouter (existing gateway mechanism)
-    → ResponseOut → FormatMessage (platform adapter)
-```
-
-Each platform implements two functions:
-- `parse_message(raw_input) → { text, platform, chat_id, user_id, thread_id }`
-- `format_output(agent_response, prefix, platform_context) → platform_native_message`
-
-Initial focus: **Telegram** (existing integration). WhatsApp/Discord follow once Telegram implementation is stable.
+**Session key format:** `agent:{agent_name}:{platform}:{chat_type}:{chat_id}:{session_id}`
 
 ---
 
-## Deployment & Configuration Model (EVOL-style)
+## Phase 0 Deliverables (Skeleton)
 
-Following the EVOL plugin reference architecture:
-
-### Installation
-```bash
-# Clone to plugins directory
-cd ~/.hermes/plugins/
-git clone https://github.com/falke-ai-circuit/hermes-multiplex.git multiplex
-
-# Enable in gateway config.yaml
-plugins:
-  enabled:
-    - multiplex
-
-# Restart gateway (required for plugin code changes)
-docker restart hermes-agent-llic-conductor-1
-```
-
-### Runtime Configuration
-```bash
-# All configuration via chat commands
-/multiplex config set agents.analyst.enabled true
-/multiplex config set settings.auto_switch_on_spawn true
-/multiplex config set settings.prefix_format "[{agent}-{session_id}]"
-/multiplex config get  # Show full config
-```
-
-### State Persistence
-```
-~/.hermes/profiles/conductor/plugins/multiplex/
-├── config.yaml          # User configuration
-├── state/               # Runtime state (session tracker)
-│   └── sessions.json    # Per-chat session registry
-├── logs/                # Plugin operation logs
-└── migrations/          # Config schema migrations
-```
+- [x] Project scaffold + plugin.yaml manifest
+- [x] Architecture blueprint (this document)
+- [x] GitHub repo: `falke-ai-circuit/hermes-multiplex`
+- [ ] `pre_gateway_dispatch` trace — verify hook fires before profile routing
+- [ ] Session key isolation test — confirm per-agent context separation
+- [ ] `delegate_task` response intercept proof-of-concept
 
 ---
 
 ## Roadmap
 
-### Phase 0: Foundation (Week 1)
-- [ ] Project repo setup: `falke-ai-circuit/hermes-multiplex`
-- [ ] Plugin skeleton with `plugin.yaml`, `register()`, empty commands
-- [ ] Config YAML schema + validation
-- [ ] Test harness: simulate Telegram messages
+### Phase 1: Core Routing (Week 1-2)
+- [ ] `@agentname` parser — extract agent name + message from inline mention
+- [ ] `@sessionid` parser — route to specific session by ID
+- [ ] Session tracker — create, find, resume, idle, archive
+- [ ] `/multix` command parser — switch, spawn, list, kill, config
+- [ ] Gateway `pre_gateway_dispatch` integration
+- [ ] Response prefix injection `[agent-session_id]`
 
-### Phase 1: Core Routing (Week 2)
-- [ ] Prefix Parser: `/agent`, `@agent`, `/switch`, `/spawn`
-- [ ] Session Tracker: create, switch, idle, archive
-- [ ] Integration with `pre_gateway_dispatch` hook
-- [ ] Basic response relay with prefix injection
+### Phase 2: Session Management (Week 2-3)
+- [ ] `/multix switch` — change default routing
+- [ ] `/multix spawn` — explicit new session
+- [ ] `/multix list` — active sessions display
+- [ ] `/multix kill` — session termination
+- [ ] Session persistence — survive gateway restart
 
-### Phase 2: Full Session Management (Week 3)
-- [ ] `/switch` command with session persistence
-- [ ] `/spawn` with optional auto-switch
-- [ ] `/list` active sessions display
-- [ ] Cross-session `@agent` messaging from any session
-
-### Phase 3: Subagent Visibility (Week 4)
-- [ ] Intercept `delegate_task` responses for inline display
-- [ ] Chain prefix: `[main-d9e3→analyst-4f2a]` for delegation chains
+### Phase 3: Subagent Visibility (Week 3-4)
+- [ ] `delegate_task` response interceptor
+- [ ] Inline subagent chain: `[main→analyst→reviewer]`
 - [ ] Completion signaling: "Analyst done. Coder applying fix..."
 
-### Phase 4: Platform Abstraction (Week 5)
-- [ ] Platform adapter interface
-- [ ] WhatsApp web adapter (secondary)
-- [ ] Discord adapter (secondary)
-- [ ] CLI multi-session support
-
-### Phase 5: Configuration UI (Week 6)
-- [ ] `/multiplex config` command suite (get/set/reset)
-- [ ] Agent enable/disable per platform
+### Phase 4: Configuration (Week 4-5)
+- [ ] `/multix config get/set`
+- [ ] Per-agent enable/disable
 - [ ] Prefix format customization
-- [ ] Session retention policies
+- [ ] Auto-create agent toggle
+
+### Phase 5: Platform Abstraction (Week 5-6)
+- [ ] Platform adapter interface
+- [ ] CLI multi-session support
+- [ ] Platform-specific response formatting
 
 ---
 
-## Technical Constraints (From Gateway Code Analysis)
+## Architecture Decisions
 
-| Constraint | Impact | Mitigation |
-|-----------|--------|------------|
-| No `sessions_spawn` API | Cannot spawn full gateway sessions programmatically | Use `delegate_task` as proxy; build session abstraction on top |
-| Per-session adapter locking | `_active_sessions` guard serializes messages per session key | Multiplex own session keys; don't fight the lock |
-| ContextVars for concurrency | Tool routing uses task-local state | Compatible — our session lookup is read-only on context vars |
-| Plugins opt-in via config.yaml | Must be explicitly enabled | Document installation clearly |
-| Profile isolation | Each agent gets full profile directory | Leverage existing profiles; no new infrastructure |
-| Gateway restart required | Plugin code changes need gateway restart | Document; hot-reload config changes only |
-
----
-
-## Architecture Decision Records (ADR)
-
-### ADR-1: Prefix Detection Location
-**Decision:** Intercept at `pre_gateway_dispatch` hook (before profile routing).
-**Rationale:** Earliest possible interception. Avoids modifying core routing code. If multiplex is disabled, zero overhead.
-**Alternative:** Post-routing interception → would require profile to process message first, adding latency.
-
-### ADR-2: Session Storage
-**Decision:** JSON file per chat_id on local filesystem.
-**Rationale:** Simple. Survives restarts. No external dependency. Migrate to Redis if scale demands it.
-**Alternative:** SQLite → adds dependency. In-memory → lost on restart.
-
-### ADR-3: Agent Communication Protocol
-**Decision:** Conductor mediates all cross-agent communication. `@agent` messages route through conductor → target agent.
-**Rationale:** Single point of control. Easy to add logging, filtering, rate limiting. Matches existing architecture.
-**Alternative:** Peer-to-peer agent messaging → complex state management, harder to debug.
-
-### ADR-4: Platform Scope
-**Decision:** Telegram first. WhatsApp/Discord follow modular adapter pattern.
-**Rationale:** Existing integration is stable. Goran uses Telegram daily. Platform abstraction layer designed from start.
+| ADR | Decision | Rationale |
+|-----|----------|-----------|
+| **ADR-1** | One prefix: `/multix` | No namespace pollution. All agent + session management under one command. |
+| **ADR-2** | `@agentname` for chat | Natural — same as mentioning someone. Zero learning curve. |
+| **ADR-3** | `@sessionid` for precision | Reference specific past sessions by their 4-char ID. |
+| **ADR-4** | `pre_gateway_dispatch` hook | Earliest interception. No core routing changes. |
+| **ADR-5** | Single chat, mixed responses | Goran's core requirement. All agents respond in the SAME chat. |
+| **ADR-6** | Conductor always mediates | Single control point. Logging, filtering, rate limiting centralized. |

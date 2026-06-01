@@ -1,0 +1,86 @@
+# Hermes Multiplex Plugin — Configuration
+#
+# Agent mappings, settings, and platform flags.
+# Loaded at plugin init time. Defaults are embedded in src/config.py
+# so the plugin works without this file; this file overrides defaults.
+
+multiplex:
+  agents:
+    analyst:
+      profile: "analyst"
+      prefix: "[analyst]"
+      description: "Root cause investigation, code analysis, FalkorDB graphs"
+      auto_create: true
+
+    coder:
+      profile: "coder"
+      prefix: "[coder]"
+      description: "Code changes, OpenHands delegation, repo work"
+      auto_create: true
+
+    researcher:
+      profile: "researcher"
+      prefix: "[researcher]"
+      description: "Web research, SearXNG, OSINT, comparative analysis"
+      auto_create: true
+
+    operative:
+      profile: "operative"
+      prefix: "[operative]"
+      description: "Docker, SSH, infrastructure, deployments"
+      auto_create: true
+
+    reviewer:
+      profile: "reviewer"
+      prefix: "[reviewer]"
+      description: "Code verification, Selenium testing, adversarial validation"
+      auto_create: true
+
+    architect:
+      profile: "architect"
+      prefix: "[architect]"
+      description: "Blueprint design, Docmost publishing, system architecture"
+      auto_create: true
+
+    orchestrator:
+      profile: "orchestrator"
+      prefix: "[orch]"
+      description: "Multi-agent lane coordination, taskboard management"
+      auto_create: true
+
+    conductor:
+      profile: "conductor"
+      prefix: "[main]"
+      description: "Conductor mediation, delegation, oversight"
+      auto_create: true
+
+    shadow:
+      profile: "shadow"
+      prefix: "[shadow]"
+      description: "Offensive security, dark reasoning, Venice API"
+      auto_create: false  # Requires explicit spawn
+
+    valmet:
+      profile: "valmet"
+      prefix: "[valmet]"
+      description: "Industrial automation, DNA protocols, LightRAG"
+      auto_create: false  # Requires explicit spawn
+
+  settings:
+    default_agent: "conductor"
+    conductor_prefix: "[main]"
+    session_idle_timeout: 900  # 15 minutes
+    auto_switch_on_spawn: true
+    show_delegation_chain: true  # Show [main→analyst→reviewer] chain
+    prefix_format: "[{agent}-{session_id}]"
+    auto_create_agents: true  # Create session on first @mention
+
+  platforms:
+    telegram:
+      enabled: true
+    web:
+      enabled: true
+    discord:
+      enabled: true
+    cli:
+      enabled: true

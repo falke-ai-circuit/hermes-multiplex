@@ -1,22 +1,20 @@
+---
 name: multiplex
-version: 0.1.0
+version: 0.2.0
 kind: standalone
-description: Multi-agent session multiplexer for Hermes Agent — switch between agent profiles within a single chat
+description: Multi-agent session multiplexer for Hermes Agent — route messages to agent profiles within a single chat using /multix commands, @agentname mentions, or @sessionid references
 author: Falke AI Circuit
 license: MIT
+repo: https://github.com/falke-ai-circuit/hermes-multiplex
 provides_tools:
   - switch_session
   - spawn_session
   - list_sessions
+  - kill_session
   - config
 commands:
-  - /switch
-  - /spawn
-  - /list
-  - /sessions
-  - /multiplex
+  - /multix
 platforms:
   - telegram
-  - whatsapp
   - discord
   - cli
